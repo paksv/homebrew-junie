@@ -7,8 +7,61 @@ class JunieAT1081 < Formula
   license "https://www.jetbrains.com/legal/docs/terms/jetbrains-junie"
 
   def install
-    # Install everything to libexec first (Homebrew convention)
+    # Install files to libexec (Homebrew convention)
     libexec.install Dir["*"]
+
+    # Create bootstrap shim - write to libexec first, then install as executable
+    (libexec/"bootstrap.sh").write(bootstrap_script)
+    (libexec/"bootstrap.sh").chmod(0755)
+    bin.install_symlink libexec/"bootstrap.sh" => "junie"
+  end
+
+  def bootstrap_script
+    # Bootstrap shim that:
+    # 1. Fast path: if ~/.local/bin/junie exists, delegate to it (1 stat call)
+    # 2. First run: copy files, install real shim, create symlink
+    <<~BASH
+      #!/bin/bash
+      set -euo pipefail
+
+      REAL_SHIM="$HOME/.local/bin/junie"
+
+      # Fast path: if real shim exists, delegate immediately
+      if [[ -x "$REAL_SHIM" ]]; then
+          exec "$REAL_SHIM" "$@"
+      fi
+
+      # First-run setup
+      echo "[Junie] First run - setting up..." >&2
+
+      JUNIE_DATA="$HOME/.local/share/junie"
+      VERSION="#{version}"
+      HOMEBREW_LIBEXEC="#{libexec}"
+
+      # Create directories
+      mkdir -p "$HOME/.local/bin"
+      mkdir -p "$JUNIE_DATA/versions"
+      mkdir -p "$JUNIE_DATA/updates"
+
+      # Copy files from Homebrew Cellar to user directory
+      VERSION_DIR="$JUNIE_DATA/versions/$VERSION"
+      cp -R "$HOMEBREW_LIBEXEC/." "$VERSION_DIR"
+      xattr -dr com.apple.quarantine "$VERSION_DIR" 2>/dev/null || true
+
+      # Install real shim
+      cat > "$REAL_SHIM" << 'SHIM_EOF'
+#{shim_script}
+SHIM_EOF
+      chmod +x "$REAL_SHIM"
+
+      # Create current symlink
+      ln -sfn "$VERSION_DIR" "$JUNIE_DATA/current"
+
+      echo "[Junie] Setup complete!" >&2
+
+      # Run
+      exec "$REAL_SHIM" "$@"
+    BASH
   end
 
   def shim_script
@@ -314,41 +367,15 @@ class JunieAT1081 < Formula
     SHIM
   end
 
-  def post_install
-    # Create unified directory structure (same as npm installer)
-    junie_bin = Pathname.new(Dir.home) / ".local" / "bin"
-    junie_data = Pathname.new(Dir.home) / ".local" / "share" / "junie"
-    versions_dir = junie_data / "versions"
-    updates_dir = junie_data / "updates"
-    version_dir = versions_dir / version.to_s
-
-    junie_bin.mkpath
-    versions_dir.mkpath
-    updates_dir.mkpath
-
-    # Copy extracted contents to version directory
-    FileUtils.rm_rf(version_dir)
-    FileUtils.cp_r(libexec.to_s + "/.", version_dir)
-
-    # Install shim script to ~/.local/bin/junie (read from ej-app/cli-standalone/package/shim/junie.sh)
-    shim_dest = junie_bin / "junie"
-    shim_dest.write(shim_script)
-    shim_dest.chmod(0755)
-
-    # Create current symlink
-    current_link = junie_data / "current"
-    current_link.unlink if current_link.symlink? || current_link.exist?
-    current_link.make_symlink(version_dir)
-
-    # Remove quarantine attribute on macOS
-    system "xattr", "-dr", "com.apple.quarantine", version_dir.to_s rescue nil
-  end
-
   def caveats
     <<~EOS
-      Junie has been installed to ~/.local/share/junie/versions/#{version}
+      Junie has been installed!
 
-      To use junie, ensure ~/.local/bin is in your PATH:
+      On first run, Junie will set up:
+        ~/.local/share/junie/versions/#{version}/  (binary)
+        ~/.local/bin/junie                          (shim for auto-updates)
+
+      For faster subsequent runs, add ~/.local/bin to your PATH:
         export PATH="$HOME/.local/bin:$PATH"
 
       Add this to your shell profile (~/.bashrc, ~/.zshrc) for persistence.
@@ -356,9 +383,8 @@ class JunieAT1081 < Formula
   end
 
   test do
-    # Test the shim
-    shim_path = Pathname.new(Dir.home) / ".local" / "bin" / "junie"
-    assert_predicate shim_path, :exist?
-    assert_predicate shim_path, :executable?
+    # Test that bootstrap shim exists and is executable
+    assert_predicate bin/"junie", :exist?
+    assert_predicate bin/"junie", :executable?
   end
 end
